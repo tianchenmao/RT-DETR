@@ -14,6 +14,8 @@ import torch.amp
 from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp.grad_scaler import GradScaler
 
+import json
+
 from ..optim import ModelEMA, Warmup
 from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
@@ -34,6 +36,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     ema :ModelEMA = kwargs.get('ema', None)
     scaler :GradScaler = kwargs.get('scaler', None)
     lr_warmup_scheduler :Warmup = kwargs.get('lr_warmup_scheduler', None)
+
+    cluster_box_record = []
 
     for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         samples = samples.to(device)
@@ -96,10 +100,20 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 writer.add_scalar(f'Lr/pg_{j}', pg['lr'], global_step)
             for k, v in loss_dict_reduced.items():
                 writer.add_scalar(f'Loss/{k}', v.item(), global_step)
-                
+
+        # record cluster box
+        cluster_box = outputs['cluster_box']
+        if targets is not None:
+            image_ids = [t['image_id'] for t in targets]
+            for image_id, cbox in zip(image_ids, cluster_box):
+                cbox['image_id'] = int(image_id.cpu())
+                cbox['epoch'] = epoch
+        cluster_box_record.extend(cluster_box)
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
+    with open(r'C:\Users\fur\PycharmProjects\RT-DETR\rtdetrv2_pytorch\records\cluster_box_records.json','a') as f:
+        f.write(json.dumps(cluster_box_record) + '\n')
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 

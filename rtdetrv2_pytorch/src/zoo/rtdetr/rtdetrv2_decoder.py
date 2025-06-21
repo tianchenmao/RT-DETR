@@ -12,6 +12,9 @@ import torch.nn.functional as F
 import torch.nn.init as init 
 from typing import List
 
+from sklearn.cluster import DBSCAN
+from sklearn.decomposition import PCA
+
 from .denoising import get_contrastive_denoising_training_group
 from .utils import deformable_attention_core_func_v2, get_activation, inverse_sigmoid
 from .utils import bias_init_with_prob
@@ -479,6 +482,129 @@ class RTDETRTransformerv2(nn.Module):
 
         return anchors, valid_mask
 
+    def cluster_based_query_generation(self,features, logits, base_memory, base_boxes, base_logits, spatial_shapes,
+                                       box_deltas, max_queries=300, eps=0.05, min_samples=3, margin=0.01):
+        """
+        Args:
+            features: [B, L, C], encoder memory output
+            logits: [B, L, num_classes], encoder scores
+            base_memory: [B, N, C], original top-k memory features
+            base_boxes: [B, N, 4], original top-k unactivated boxes
+            base_logits: [B, N, 1], original top-k logits
+            spatial_shapes: [num_levels, 2], tensor with (H, W) of each encoder level
+            box_deltas: [B, H*W, 4], encoder bbox head output (i.e., predicted box offsets)
+            max_queries: int, maximum number of query slots (default: 300)
+            eps: float, DBSCAN neighborhood threshold (in normalized [0,1] units)
+            min_samples: int, DBSCAN minimum number of samples to form a cluster
+
+        Returns:
+            merged_feats: [B, N, C], updated query features
+            merged_boxes: [B, N, 4], updated unactivated query boxes
+            merged_logits: [B, N, 1], updated query logits
+        """
+        B, L, C = features.shape
+        N = base_memory.shape[1]
+        merged_feats, merged_coords, merged_scores = [], [], []
+        cluster_box_records = []
+
+        coords_all = []
+        for (Hi, Wi) in spatial_shapes:
+            y, x = torch.meshgrid(
+                torch.linspace(0, 1, Hi),
+                torch.linspace(0, 1, Wi), indexing='ij')
+            coord = torch.stack([y, x], dim=-1).reshape(-1, 2)
+            coords_all.append(coord)
+        coords = torch.cat(coords_all, dim=0).to(features.device)  # [L, 2]
+
+        for b in range(B):
+            cls_scores = logits[b].max(dim=-1).values  # [L]
+            topk = min(1000, L)
+            topk_idx = cls_scores.topk(topk).indices  # [topk]
+
+            points_xy = coords[topk_idx]  # [topk, 2]
+            feats = features[b][topk_idx]  # [topk, C]
+            score_vals = logits[b][topk_idx]  # [topk, 1]
+            box_delta_topk = box_deltas[b][topk_idx]  # [topk, 4]
+
+            with torch.no_grad():
+                pca = PCA(n_components=2)
+                feats_pca = torch.from_numpy(pca.fit_transform(feats.cpu().numpy())).to(feats.device)
+
+            cluster_input = torch.cat([points_xy, feats_pca], dim=-1).cpu().numpy()
+
+            try:
+                cluster = DBSCAN(eps=eps, min_samples=min_samples).fit(cluster_input)
+                labels = cluster.labels_
+            except:
+                labels = -torch.ones(topk, dtype=torch.long)
+
+            num_clusters = max(labels.max() + 1, 0)
+            cluster_feats, cluster_coords, cluster_logits = [], [], []
+
+            for k in range(num_clusters):
+                mask_k = (labels == k)
+                if mask_k.sum() == 0:
+                    continue
+                idx = torch.from_numpy(mask_k).nonzero(as_tuple=False).squeeze(1).to(feats.device)
+                pts = points_xy[idx]  # [N_k, 2]
+                # TODO 对簇内特征进行平均还是取最值
+                feat_k = feats[idx].mean(dim=0)
+                logit_k = score_vals[idx].max(dim=0).values
+
+                cxcy = pts.mean(dim=0)
+                # skip boxes near border
+                if (cxcy < margin).any() or (cxcy > 1-margin).any():
+                    continue
+                wh = pts.max(dim=0).values - pts.min(dim=0).values + 1e-6
+                ref_box = torch.cat([cxcy, wh], dim=-1)  # [4]
+                # inverse-sigmoid
+                ref_box = torch.clamp(torch.logit(ref_box.clamp(1e-4, 1 - 1e-4)), -10, 10)
+                delta_k = box_delta_topk[idx].mean(dim=0)
+                # TODO Does delta work here?
+                # ref_box = ref_box + delta_k
+
+                cluster_feats.append(feat_k)
+                cluster_coords.append(ref_box)
+                cluster_logits.append(logit_k)
+
+            if len(cluster_feats) == 0:
+                cluster_box_records.append({'bboxes': []})
+                merged_feats.append(base_memory[b])
+                merged_coords.append(base_boxes[b])
+                merged_scores.append(base_logits[b])
+                continue
+
+            cluster_feats = torch.stack(cluster_feats, dim=0)
+            cluster_coords = torch.stack(cluster_coords, dim=0)
+            cluster_logits = torch.stack(cluster_logits, dim=0)
+
+            cluster_coords_sigmoid = torch.sigmoid(cluster_coords.detach().cpu())
+            cluster_box_records.append({
+                'bboxes': cluster_coords_sigmoid.tolist()  # normalized cxcywh
+            })
+
+            n_new = cluster_feats.shape[0]
+            n_old = base_memory.shape[1]
+            n_keep = max(n_old - n_new, 0)
+
+            base_scores = base_logits[b].max(dim=-1).values
+            base_order = base_scores.argsort(descending=True)[:n_keep]
+
+            merged_feat = torch.cat([base_memory[b][base_order], cluster_feats], dim=0)
+            merged_box = torch.cat([base_boxes[b][base_order], cluster_coords], dim=0)
+            merged_logit = torch.cat([base_logits[b][base_order], cluster_logits], dim=0)
+
+            if merged_feat.shape[0] < n_old:
+                pad = n_old - merged_feat.shape[0]
+                merged_feat = F.pad(merged_feat, (0, 0, 0, pad))
+                merged_box = F.pad(merged_box, (0, 0, 0, pad))
+                merged_logit = F.pad(merged_logit, (0, 0, 0, pad))
+
+            merged_feats.append(merged_feat)
+            merged_coords.append(merged_box)
+            merged_scores.append(merged_logit)
+
+        return torch.stack(merged_feats),  torch.stack(merged_scores), torch.stack(merged_coords), cluster_box_records # [B, N, C], [B, N, 1], [B, N, 4]
 
     def _get_decoder_input(self,
                            memory: torch.Tensor,
@@ -499,12 +625,16 @@ class RTDETRTransformerv2(nn.Module):
 
         output_memory :torch.Tensor = self.enc_output(memory)
         enc_outputs_logits :torch.Tensor = self.enc_score_head(output_memory)
-        enc_outputs_coord_unact :torch.Tensor = self.enc_bbox_head(output_memory) + anchors
+        box_deltas = self.enc_bbox_head(output_memory)
+        enc_outputs_coord_unact :torch.Tensor = box_deltas + anchors
 
         enc_topk_bboxes_list, enc_topk_logits_list = [], []
         enc_topk_memory, enc_topk_logits, enc_topk_bbox_unact = \
             self._select_topk(output_memory, enc_outputs_logits, enc_outputs_coord_unact, self.num_queries)
-            
+
+        enc_topk_memory, enc_topk_logits, enc_topk_bbox_unact, cluster_box_records = self.cluster_based_query_generation(
+            output_memory, enc_outputs_logits, enc_topk_memory, enc_topk_bbox_unact, enc_topk_logits,spatial_shapes, box_deltas, max_queries=self.num_queries)
+
         if self.training:
             enc_topk_bboxes = F.sigmoid(enc_topk_bbox_unact)
             enc_topk_bboxes_list.append(enc_topk_bboxes)
@@ -524,7 +654,7 @@ class RTDETRTransformerv2(nn.Module):
             enc_topk_bbox_unact = torch.concat([denoising_bbox_unact, enc_topk_bbox_unact], dim=1)
             content = torch.concat([denoising_logits, content], dim=1)
         
-        return content, enc_topk_bbox_unact, enc_topk_bboxes_list, enc_topk_logits_list
+        return content, enc_topk_bbox_unact, enc_topk_bboxes_list, enc_topk_logits_list, cluster_box_records
 
     def _select_topk(self, memory: torch.Tensor, outputs_logits: torch.Tensor, outputs_coords_unact: torch.Tensor, topk: int):
         if self.query_select_method == 'default':
@@ -568,7 +698,7 @@ class RTDETRTransformerv2(nn.Module):
         else:
             denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None
 
-        init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list = \
+        init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list, cluster_box_records = \
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
@@ -596,6 +726,8 @@ class RTDETRTransformerv2(nn.Module):
             if dn_meta is not None:
                 out['dn_aux_outputs'] = self._set_aux_loss(dn_out_logits, dn_out_bboxes)
                 out['dn_meta'] = dn_meta
+
+        out['cluster_box'] = cluster_box_records
 
         return out
 
