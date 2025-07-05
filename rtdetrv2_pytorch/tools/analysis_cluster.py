@@ -10,28 +10,28 @@ def load_coco_id_to_filename(coco_json_path):
     id_to_filename = {img['id']: img['file_name'] for img in coco_data['images']}
     return id_to_filename
 
-def visualize_batch(json_line, id_to_filename, image_dir, start_epoch=0):
-    data = json.loads(json_line)
-
+def show_batch(group, id_to_filename, image_dir):
     fig, axs = plt.subplots(2, 4, figsize=(16, 8))
     axs = axs.flatten()
 
-    for idx, item in enumerate(data):
+    for idx in range(8):
+        if idx >= len(group):
+            axs[idx].axis('off')
+            continue
+
+        item = group[idx]
         image_id = item['image_id']
         bboxes = item['bboxes']
-        epoch = item['epoch']
-        if epoch > start_epoch:
-            break
 
         file_name = id_to_filename.get(image_id)
         if file_name is None:
-            print(f"Image ID {image_id} not found in COCO annotations.")
+            axs[idx].set_title(f"ID {image_id} not found")
             axs[idx].axis('off')
             continue
 
         image_path = os.path.join(image_dir, file_name)
         if not os.path.exists(image_path):
-            print(f"Image file not found: {image_path}")
+            axs[idx].set_title(f"Missing: {file_name}")
             axs[idx].axis('off')
             continue
 
@@ -47,16 +47,28 @@ def visualize_batch(json_line, id_to_filename, image_dir, start_epoch=0):
             y = (cy - h / 2) * h_img
             width = w * w_img
             height = h * h_img
-
             rect = patches.Rectangle((x, y), width, height, linewidth=2,
                                      edgecolor='red', facecolor='none')
             axs[idx].add_patch(rect)
 
-    for j in range(len(data), 8):
-        axs[j].axis('off')
-
     plt.tight_layout()
     plt.show()
+
+def visualize_json_in_chunks(batch_json_path, id_to_filename, image_dir, start_epoch=0):
+    with open(batch_json_path, "r") as f:
+        for line in f:
+            try:
+                data = json.loads(line)
+                if data[0]['epoch'] < start_epoch:
+                    continue
+            except json.JSONDecodeError:
+                continue
+
+            # 按8个一组进行显示
+            for i in range(0, len(data), 8):
+                group = data[i:i+8]
+                show_batch(group, id_to_filename, image_dir)
+                input("Press Enter to continue...")
 
 if __name__ == "__main__":
     # 示例使用
@@ -66,8 +78,4 @@ if __name__ == "__main__":
 
     # 创建映射
     id_to_filename = load_coco_id_to_filename(coco_json_path)
-
-    # 逐行处理batch JSON
-    with open(batch_json_path, "r") as f:
-        for line in f:
-            visualize_batch(line, id_to_filename, image_dir,start_epoch=30)
+    visualize_json_in_chunks(batch_json_path, id_to_filename, image_dir,start_epoch=50)

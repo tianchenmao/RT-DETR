@@ -18,6 +18,11 @@ class DetSolver(BaseSolver):
     def fit(self, ):
         print("Start training")
         self.train()
+        # for name, param in self.model.named_parameters():
+        #     if "decoder" in name or "objectness" in name:
+        #         param.requires_grad = True
+        #     else:
+        #         param.requires_grad = False
         args = self.cfg
 
         n_parameters = sum([p.numel() for p in self.model.parameters() if p.requires_grad])

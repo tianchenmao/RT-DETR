@@ -12,8 +12,10 @@ def get_contrastive_denoising_training_group(targets,
                                              num_classes,
                                              num_queries,
                                              class_embed,
+                                             count_embed,
                                              num_denoising=100,
                                              label_noise_ratio=0.5,
+                                             count_noise_scale=2,
                                              box_noise_scale=1.0,):
     """cnd"""
     if num_denoising <= 0:
@@ -32,6 +34,7 @@ def get_contrastive_denoising_training_group(targets,
     bs = len(num_gts)
 
     input_query_class = torch.full([bs, max_gt_num], num_classes, dtype=torch.int32, device=device)
+    input_query_count = torch.full([bs, max_gt_num], 0, dtype=torch.int32, device=device)
     input_query_bbox = torch.zeros([bs, max_gt_num, 4], device=device)
     pad_gt_mask = torch.zeros([bs, max_gt_num], dtype=torch.bool, device=device)
 
@@ -39,10 +42,12 @@ def get_contrastive_denoising_training_group(targets,
         num_gt = num_gts[i]
         if num_gt > 0:
             input_query_class[i, :num_gt] = targets[i]['labels']
+            input_query_count[i, :num_gt] = targets[i]['labels']
             input_query_bbox[i, :num_gt] = targets[i]['boxes']
             pad_gt_mask[i, :num_gt] = 1
     # each group has positive and negative queries.
     input_query_class = input_query_class.tile([1, 2 * num_group])
+    input_query_count = input_query_count.tile([1, 2 * num_group])
     input_query_bbox = input_query_bbox.tile([1, 2 * num_group, 1])
     pad_gt_mask = pad_gt_mask.tile([1, 2 * num_group])
     # positive and negative mask
@@ -61,7 +66,10 @@ def get_contrastive_denoising_training_group(targets,
         mask = torch.rand_like(input_query_class, dtype=torch.float) < (label_noise_ratio * 0.5)
         # randomly put a new one here
         new_label = torch.randint_like(mask, 0, num_classes, dtype=input_query_class.dtype)
+        count_noise = torch.randint_like(input_query_count, low=-count_noise_scale, high=count_noise_scale+1)  # -2 ~ +2
         input_query_class = torch.where(mask & pad_gt_mask, new_label, input_query_class)
+        input_query_count = torch.where(mask & pad_gt_mask, input_query_count + count_noise, input_query_count)
+        input_query_count = torch.clamp(input_query_count, min=0.0)  # count must be non-negative
 
     if box_noise_scale > 0:
         known_bbox = box_cxcywh_to_xyxy(input_query_bbox)
@@ -75,6 +83,7 @@ def get_contrastive_denoising_training_group(targets,
         input_query_bbox_unact = inverse_sigmoid(input_query_bbox)
 
     input_query_logits = class_embed(input_query_class)
+    input_query_count_logits = input_query_logits = count_embed(input_query_count.unsqueeze(-1)) # shape [bs, N, 1] → [bs, N, hidden_dim]
 
     tgt_size = num_denoising + num_queries
     attn_mask = torch.full([tgt_size, tgt_size], False, dtype=torch.bool, device=device)
@@ -101,4 +110,4 @@ def get_contrastive_denoising_training_group(targets,
     # print(input_query_bbox.shape) # torch.Size([4, 196, 4])
     # print(attn_mask.shape) # torch.Size([496, 496])
     
-    return input_query_logits, input_query_bbox_unact, attn_mask, dn_meta
+    return input_query_logits, input_query_count_logits, input_query_bbox_unact, attn_mask, dn_meta

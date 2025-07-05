@@ -1,23 +1,14 @@
-"""
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
-COCO evaluator that works in distributed mode.
-Mostly copy-paste from https://github.com/pytorch/vision/blob/edfd5a7/references/detection/coco_eval.py
-The difference is that there is less copy-pasting from pycocotools
-in the end of the file, as python3 can suppress prints with contextlib
-
-# MiXaiLL76 replacing pycocotools with faster-coco-eval for better performance and support.
-"""
-
+import copy
 import os
 import contextlib
-import copy
 import numpy as np
 import torch
-
-from faster_coco_eval import COCO, COCOeval_faster
-import faster_coco_eval.core.mask as mask_util
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+from pycocotools import mask as mask_util
 from ...core import register
 from ...misc import dist_utils
+
 __all__ = ['CocoEvaluator',]
 
 
@@ -26,12 +17,13 @@ class CocoEvaluator(object):
     def __init__(self, coco_gt, iou_types):
         assert isinstance(iou_types, (list, tuple))
         coco_gt = copy.deepcopy(coco_gt)
-        self.coco_gt : COCO = coco_gt
+        self.coco_gt = coco_gt
         self.iou_types = iou_types
 
         self.coco_eval = {}
         for iou_type in iou_types:
-            self.coco_eval[iou_type] = COCOeval_faster(coco_gt, iouType=iou_type, print_function=print, separate_eval=True)
+            self.coco_eval[iou_type] = COCOeval(coco_gt, iouType=iou_type)
+            self.coco_eval[iou_type].params.useCats = False
 
         self.img_ids = []
         self.eval_imgs = {k: [] for k in iou_types}
@@ -39,10 +31,10 @@ class CocoEvaluator(object):
     def cleanup(self):
         self.coco_eval = {}
         for iou_type in self.iou_types:
-            self.coco_eval[iou_type] = COCOeval_faster(self.coco_gt, iouType=iou_type, print_function=print, separate_eval=True)
+            self.coco_eval[iou_type] = COCOeval(self.coco_gt, iouType=iou_type)
+            self.coco_eval[iou_type].params.useCats = False
         self.img_ids = []
         self.eval_imgs = {k: [] for k in self.iou_types}
-
 
     def update(self, predictions):
         img_ids = list(np.unique(list(predictions.keys())))
@@ -59,16 +51,20 @@ class CocoEvaluator(object):
                     coco_eval.params.imgIds = list(img_ids)
                     coco_eval.evaluate()
 
-            self.eval_imgs[iou_type].append(np.array(coco_eval._evalImgs_cpp).reshape(len(coco_eval.params.catIds), len(coco_eval.params.areaRng), len(coco_eval.params.imgIds)))
+            self.eval_imgs[iou_type].append(coco_eval.evalImgs)
 
     def synchronize_between_processes(self):
         for iou_type in self.iou_types:
             img_ids, eval_imgs = merge(self.img_ids, self.eval_imgs[iou_type])
-
             coco_eval = self.coco_eval[iou_type]
+
             coco_eval.params.imgIds = img_ids
-            coco_eval._paramsEval = copy.deepcopy(coco_eval.params)
-            coco_eval._evalImgs_cpp = eval_imgs
+
+            # flatten if nested list
+            if isinstance(eval_imgs, list) and any(isinstance(e, list) for e in eval_imgs):
+                eval_imgs = [item for sublist in eval_imgs for item in sublist]
+
+            coco_eval.evalImgs = eval_imgs
 
     def accumulate(self):
         for coco_eval in self.coco_eval.values():
@@ -76,7 +72,6 @@ class CocoEvaluator(object):
 
     def summarize(self):
         for iou_type, coco_eval in self.coco_eval.items():
-            print("IoU metric: {}".format(iou_type))
             coco_eval.summarize()
 
     def prepare(self, predictions, iou_type):
@@ -119,12 +114,7 @@ class CocoEvaluator(object):
             if len(prediction) == 0:
                 continue
 
-            scores = prediction["scores"]
-            labels = prediction["labels"]
-            masks = prediction["masks"]
-
-            masks = masks > 0.5
-
+            masks = prediction["masks"] > 0.5
             scores = prediction["scores"].tolist()
             labels = prediction["labels"].tolist()
 
@@ -154,19 +144,16 @@ class CocoEvaluator(object):
             if len(prediction) == 0:
                 continue
 
-            boxes = prediction["boxes"]
-            boxes = convert_to_xywh(boxes).tolist()
             scores = prediction["scores"].tolist()
             labels = prediction["labels"].tolist()
-            keypoints = prediction["keypoints"]
-            keypoints = keypoints.flatten(start_dim=1).tolist()
+            keypoints = prediction["keypoints"].flatten(start_dim=1).tolist()
 
             coco_results.extend(
                 [
                     {
                         "image_id": original_id,
                         "category_id": labels[k],
-                        'keypoints': keypoint,
+                        "keypoints": keypoint,
                         "score": scores[k],
                     }
                     for k, keypoint in enumerate(keypoints)
@@ -179,24 +166,30 @@ def convert_to_xywh(boxes):
     xmin, ymin, xmax, ymax = boxes.unbind(1)
     return torch.stack((xmin, ymin, xmax - xmin, ymax - ymin), dim=1)
 
+
 def merge(img_ids, eval_imgs):
+    # Gather from all processes
     all_img_ids = dist_utils.all_gather(img_ids)
     all_eval_imgs = dist_utils.all_gather(eval_imgs)
 
+    # Merge img_ids
     merged_img_ids = []
     for p in all_img_ids:
         merged_img_ids.extend(p)
-
-    merged_eval_imgs = []
-    for p in all_eval_imgs:
-        merged_eval_imgs.extend(p)
-
-
     merged_img_ids = np.array(merged_img_ids)
-    merged_eval_imgs = np.concatenate(merged_eval_imgs, axis=2).ravel()
-    # merged_eval_imgs = np.array(merged_eval_imgs).T.ravel()
 
-    # keep only unique (and in sorted order) images
+    # Merge and flatten evalImgs
+    merged_eval_imgs = []
+    for eval_img_list in all_eval_imgs:
+        # 每个 eval_img_list 是一个 list（每个 batch）
+        for entry in eval_img_list:
+            if isinstance(entry, list):
+                merged_eval_imgs.extend(entry)  # entry 是每个 image 的 evalImgs
+            else:
+                merged_eval_imgs.append(entry)
+
+    # 去重（按 img_id）
     merged_img_ids, idx = np.unique(merged_img_ids, return_index=True)
 
-    return merged_img_ids.tolist(), merged_eval_imgs.tolist()
+    return merged_img_ids.tolist(), merged_eval_imgs
+

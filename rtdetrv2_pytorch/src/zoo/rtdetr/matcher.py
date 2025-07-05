@@ -40,6 +40,8 @@ class HungarianMatcher(nn.Module):
         self.cost_class = weight_dict['cost_class']
         self.cost_bbox = weight_dict['cost_bbox']
         self.cost_giou = weight_dict['cost_giou']
+        self.cost_objectness = weight_dict['cost_objectness']
+        self.cost_count = weight_dict['cost_count']
 
         self.use_focal_loss = use_focal_loss
         self.alpha = alpha
@@ -71,12 +73,20 @@ class HungarianMatcher(nn.Module):
         bs, num_queries = outputs["pred_logits"].shape[:2]
 
         # We flatten to compute the cost matrices in a batch
-        if self.use_focal_loss:
-            out_prob = F.sigmoid(outputs["pred_logits"].flatten(0, 1))
-        else:
-            out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # [batch_size * num_queries, num_classes]
+        # if self.use_focal_loss:
+        #     out_prob = F.sigmoid(outputs["pred_logits"].flatten(0, 1))
+        # else:
+        #     out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # [batch_size * num_queries, num_classes]
+
+        out_obj = F.sigmoid(outputs["pred_objectness_logits"].flatten(0, 1).squeeze(-1))  # [B*Q]
 
         out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [batch_size * num_queries, 4]
+
+        if "pred_counts" in outputs:
+            out_count = outputs["pred_counts"].flatten(0, 1).squeeze(-1)  # [bs*num_queries]
+
+            # 获取 GT count：即 targets[i]['labels'][j]，其中 label 是 count
+            tgt_count = torch.cat([v["labels"] for v in targets]).to(dtype=out_count.dtype)
 
         # Also concat the target labels and boxes
         tgt_ids = torch.cat([v["labels"] for v in targets])
@@ -85,22 +95,28 @@ class HungarianMatcher(nn.Module):
         # Compute the classification cost. Contrary to the loss, we don't use the NLL,
         # but approximate it in 1 - proba[target class].
         # The 1 is a constant that doesn't change the matching, it can be ommitted.
-        if self.use_focal_loss:
-            out_prob = out_prob[:, tgt_ids]
-            neg_cost_class = (1 - self.alpha) * (out_prob ** self.gamma) * (-(1 - out_prob + 1e-8).log())
-            pos_cost_class = self.alpha * ((1 - out_prob) ** self.gamma) * (-(out_prob + 1e-8).log())
-            cost_class = pos_cost_class - neg_cost_class        
-        else:
-            cost_class = -out_prob[:, tgt_ids]
+        # if self.use_focal_loss:
+        #     out_prob = out_prob[:, tgt_ids]
+        #     neg_cost_class = (1 - self.alpha) * (out_prob ** self.gamma) * (-(1 - out_prob + 1e-8).log())
+        #     pos_cost_class = self.alpha * ((1 - out_prob) ** self.gamma) * (-(out_prob + 1e-8).log())
+        #     cost_class = pos_cost_class - neg_cost_class
+        # else:
+        #     cost_class = -out_prob[:, tgt_ids]
 
         # Compute the L1 cost between boxes
         cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
 
         # Compute the giou cost betwen boxes
         cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
-        
+
+        # Compute the objectness cost
+        cost_objectness = -out_obj.unsqueeze(-1)
+
+        # Compute the L1 cost between counts
+        cost_count = torch.cdist(out_count.unsqueeze(-1), tgt_count.unsqueeze(-1), p=1)
+
         # Final cost matrix
-        C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+        C = self.cost_bbox * cost_bbox + self.cost_giou * cost_giou + self.cost_objectness * cost_objectness + self.cost_count * cost_count
         C = C.view(bs, num_queries, -1).cpu()
 
         sizes = [len(v["boxes"]) for v in targets]

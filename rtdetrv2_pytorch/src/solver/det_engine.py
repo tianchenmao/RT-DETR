@@ -15,11 +15,14 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp.grad_scaler import GradScaler
 
 import json
+import numpy as np
+from torchvision.ops import box_iou
 
 from ..optim import ModelEMA, Warmup
 from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
 
+from .metric import ObjectnessEvaluatorHungarian,print_eval_metrics_full
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -102,18 +105,18 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 writer.add_scalar(f'Loss/{k}', v.item(), global_step)
 
         # record cluster box
-        cluster_box = outputs['cluster_box']
-        if targets is not None:
-            image_ids = [t['image_id'] for t in targets]
-            for image_id, cbox in zip(image_ids, cluster_box):
-                cbox['image_id'] = int(image_id.cpu())
-                cbox['epoch'] = epoch
-        cluster_box_record.extend(cluster_box)
+        # cluster_box = outputs['cluster_box']
+        # if targets is not None:
+        #     image_ids = [t['image_id'] for t in targets]
+        #     for image_id, cbox in zip(image_ids, cluster_box):
+        #         cbox['image_id'] = int(image_id.cpu())
+        #         cbox['epoch'] = epoch
+        # cluster_box_record.extend(cluster_box)
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
-    with open(r'C:\Users\fur\PycharmProjects\RT-DETR\rtdetrv2_pytorch\records\cluster_box_records.json','a') as f:
-        f.write(json.dumps(cluster_box_record) + '\n')
+    # with open(r'C:\Users\fur\PycharmProjects\RT-DETR\rtdetrv2_pytorch\records\cluster_box_records.json','a') as f:
+    #     f.write(json.dumps(cluster_box_record) + '\n')
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
@@ -125,6 +128,7 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
     iou_types = coco_evaluator.iou_types
 
     metric_logger = MetricLogger(delimiter="  ")
+    evaluator = ObjectnessEvaluatorHungarian()
     header = 'Test:'
     
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
@@ -135,7 +139,8 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
 
         # TODO (lyuwenyu), fix dataset converted using `convert_to_coco_api`?
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
-        
+        # TODO 不要硬编码图片尺寸
+        # orig_target_sizes = torch.Tensor([640,640]).to(device)
         results = postprocessor(outputs, orig_target_sizes)
 
         # if 'segm' in postprocessor.keys():
@@ -143,9 +148,14 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
         #     results = postprocessor['segm'](results, outputs, orig_target_sizes, target_sizes)
 
         res = {target['image_id'].item(): output for target, output in zip(targets, results)}
+        evaluator.update(res, targets)  # ✅ 增量更新
+
+
         if coco_evaluator is not None:
             coco_evaluator.update(res)
 
+    metrics = evaluator.compute()
+    print_eval_metrics_full(metrics, threshold=evaluator.threshold)
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -166,6 +176,5 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
             stats['coco_eval_masks'] = coco_evaluator.coco_eval['segm'].stats.tolist()
             
     return stats, coco_evaluator
-
 
 

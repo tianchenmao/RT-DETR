@@ -218,6 +218,7 @@ class RTDETRCriterion(nn.Module):
 
         # In case of cdn auxiliary losses. For rtdetr
         if 'dn_aux_outputs' in outputs:
+            # TODO 对比去噪只在辅助损失中使用吗
             assert 'dn_meta' in outputs, ''
             indices = self.get_cdn_matched_indices(outputs['dn_meta'], targets)
             dn_num_boxes = num_boxes * outputs['dn_meta']['dn_num_group']

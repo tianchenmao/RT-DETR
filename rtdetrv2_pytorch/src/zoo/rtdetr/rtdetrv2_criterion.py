@@ -95,6 +95,179 @@ class RTDETRCriterionv2(nn.Module):
         loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
         return {'loss_vfl': loss}
 
+    def loss_objectness_trivial(self, outputs, targets, indices, num_boxes):
+        assert 'pred_objectness_logits' in outputs
+
+        B, Q = outputs['pred_objectness_logits'].shape[:2]
+        obj_pred = outputs['pred_objectness_logits'].squeeze(-1)  # [B, Q]
+
+        # 构造 supervision mask：正样本为 1，其余为 0
+        obj_target = torch.zeros((B, Q), dtype=obj_pred.dtype, device=obj_pred.device)
+        batch_idx, query_idx = self._get_src_permutation_idx(indices)
+        obj_target[batch_idx, query_idx] = 1.0
+
+        # Binary cross entropy loss
+        loss = F.binary_cross_entropy_with_logits(obj_pred, obj_target, reduction='mean')
+        return {'loss_objectness': loss}
+
+    def loss_count_mse(self,outputs, targets, indices, num_boxes):
+        idx = self._get_src_permutation_idx(indices)
+        pred = outputs['pred_counts'][idx].squeeze(-1)
+        target = torch.cat([t['labels'][j] for t, (_, j) in zip(targets, indices)]).to(pred.dtype)
+        return {'loss_count_mse': F.mse_loss(pred, target, reduction='mean')}
+
+    def loss_count_l1(self,outputs, targets, indices, num_boxes):
+        idx = self._get_src_permutation_idx(indices)
+        pred = outputs['pred_counts'][idx].squeeze(-1)
+        target = torch.cat([t['labels'][j] for t, (_, j) in zip(targets, indices)]).to(pred.dtype)
+        return {'loss_count_l1': F.l1_loss(pred, target, reduction='mean')}
+
+    def loss_count_smooth_l1(self,outputs, targets, indices, num_boxes, beta=1.0):
+        idx = self._get_src_permutation_idx(indices)
+        pred = outputs['pred_counts'][idx].squeeze(-1)
+        target = torch.cat([t['labels'][j] for t, (_, j) in zip(targets, indices)]).to(pred.dtype)
+        return {'loss_count_smooth_l1': F.smooth_l1_loss(pred, target, beta=beta, reduction='mean')}
+
+    def loss_count_poisson(self, outputs, targets, indices, num_boxes):
+        assert 'pred_counts' in outputs
+        idx = self._get_src_permutation_idx(indices)
+
+        # 预测的 count，形状 [N]
+        src_counts = outputs['pred_counts'][idx].squeeze(-1)
+
+        # GT：从 label 中读取 count
+        target_counts = torch.cat([t['labels'][j] for t, (_, j) in zip(targets, indices)])
+        target_counts = target_counts.to(dtype=src_counts.dtype)
+
+        # Poisson NLL Loss
+        loss = F.poisson_nll_loss(src_counts, target_counts, log_input=False, full=True, reduction='mean')
+        return {'loss_count_poisson': loss}
+
+    def loss_objectness_focal(self, outputs, targets, indices, num_boxes):
+        """
+        Binary Focal Loss for objectness prediction
+        """
+        assert 'pred_objectness_logits' in outputs
+        B, Q = outputs['pred_objectness_logits'].shape[:2]
+        pred_logits = outputs['pred_objectness_logits'].squeeze(-1)  # [B, Q]
+
+        # 构造二值目标：1 为正样本（被 matcher 匹配），其余为 0
+        target = torch.zeros((B, Q), dtype=pred_logits.dtype, device=pred_logits.device)
+        batch_idx, query_idx = self._get_src_permutation_idx(indices)
+        target[batch_idx, query_idx] = 1.0  # positive samples
+
+        # Sigmoid 激活
+        prob = torch.sigmoid(pred_logits)
+        pt = prob * target + (1 - prob) * (1 - target)  # pt = p if t==1 else 1-p
+
+        # Focal loss 权重项
+        focal_weight = (1 - pt) ** self.gamma
+
+        # Alpha 权重
+        alpha_weight = self.alpha * target + (1 - self.alpha) * (1 - target)
+
+        # Focal Loss
+        loss = F.binary_cross_entropy_with_logits(pred_logits, target, reduction='none')
+        loss = (focal_weight * alpha_weight * loss).mean()
+
+        return {'loss_objectness': loss}
+
+    def loss_objectness(self, outputs, targets, indices, num_boxes):
+        """
+        IoU-aware Binary Focal Loss for objectness prediction
+        """
+        assert 'pred_objectness_logits' in outputs
+        B, Q = outputs['pred_objectness_logits'].shape[:2]
+        pred_logits = outputs['pred_objectness_logits'].squeeze(-1)  # [B, Q]
+
+        # 构造 soft target（默认值 0）
+        target = torch.zeros((B, Q), dtype=pred_logits.dtype, device=pred_logits.device)
+
+        # 获取匹配的 (batch_idx, query_idx) 对应的 IoU，作为 soft objectness label
+        batch_idx, query_idx = self._get_src_permutation_idx(indices)
+
+        # 获取预测框和 GT 框
+        pred_boxes = outputs['pred_boxes'][batch_idx, query_idx]  # [N, 4]
+        tgt_boxes = torch.cat([t['boxes'][j] for t, (_, j) in zip(targets, indices)], dim=0)
+
+        # 计算匹配框对之间的 IoU
+        ious,_ = box_iou(box_cxcywh_to_xyxy(pred_boxes), box_cxcywh_to_xyxy(tgt_boxes))
+        iou_diag = ious.diag().clamp(min=0.0, max=1.0).detach()  # [N]
+
+        # 赋予 soft target
+        target[batch_idx, query_idx] = iou_diag  # soft supervision ∈ [0, 1]
+
+        # Sigmoid 激活
+        prob = torch.sigmoid(pred_logits)
+        pt = prob * target + (1 - prob) * (1 - target)  # pt = p if t==1 else 1-p
+
+        # Focal loss 权重项
+        focal_weight = (1 - pt) ** self.gamma
+
+        # Alpha 权重项
+        alpha_weight = self.alpha * target + (1 - self.alpha) * (1 - target)
+
+        # Binary focal loss
+        loss = F.binary_cross_entropy_with_logits(pred_logits, target, reduction='none')
+        loss = (focal_weight * alpha_weight * loss).mean()
+
+        return {'loss_objectness': loss}
+
+    def loss_objectness_vfl_count(self, outputs, targets, indices, num_boxes):
+        """
+        IoU-aware + Count-aware Binary Focal Loss for objectness prediction
+        (using predicted group count vs ground truth count similarity as weight)
+        """
+        assert 'pred_objectness_logits' in outputs
+        assert 'pred_counts' in outputs
+
+        B, Q = outputs['pred_objectness_logits'].shape[:2]
+        pred_logits = outputs['pred_objectness_logits'].squeeze(-1)  # [B, Q]
+
+        # 构造 soft target（默认值 0）
+        target = torch.zeros((B, Q), dtype=pred_logits.dtype, device=pred_logits.device)
+
+        # 获取匹配的 (batch_idx, query_idx)
+        batch_idx, query_idx = self._get_src_permutation_idx(indices)
+
+        # 匹配的预测框和 GT 框
+        pred_boxes = outputs['pred_boxes'][batch_idx, query_idx]
+        tgt_boxes = torch.cat([t['boxes'][j] for t, (_, j) in zip(targets, indices)], dim=0)
+
+        # 计算 IoU 作为 soft objectness label
+        ious, _ = box_iou(box_cxcywh_to_xyxy(pred_boxes), box_cxcywh_to_xyxy(tgt_boxes))
+        iou_diag = ious.diag().clamp(min=0.0, max=1.0).detach()  # [N]
+
+        # =========  Count-aware soft weight =========
+        # 获取每个 sample 的预测 count（直接从 pred_counts 平均或 sum）
+        pred_count_map = outputs['pred_counts'].squeeze(-1)  # [B, Q]
+        pred_counts = pred_count_map.mean(dim=1).clamp(min=1.0)  # [B]
+
+        # GT count: 每个样本中 GT box 数量
+        gt_counts = torch.tensor([len(t['labels']) for t in targets],
+                                 dtype=pred_counts.dtype,
+                                 device=pred_counts.device).clamp(min=1.0)  # [B]
+
+        # count similarity ∈ [0, 1]
+        count_sim = torch.minimum(pred_counts, gt_counts) / torch.maximum(pred_counts, gt_counts)  # [B]
+        count_sim_per_sample = count_sim[batch_idx]  # [N]
+
+        # 构造 soft supervision label: soft = iou × count_sim
+        soft_label = iou_diag * count_sim_per_sample
+        target[batch_idx, query_idx] = soft_label
+
+        # ========= Binary Focal Loss =========
+        prob = torch.sigmoid(pred_logits)
+        pt = prob * target + (1 - prob) * (1 - target)
+
+        focal_weight = (1 - pt) ** self.gamma
+        alpha_weight = self.alpha * target + (1 - self.alpha) * (1 - target)
+
+        loss = F.binary_cross_entropy_with_logits(pred_logits, target, reduction='none')
+        loss = (focal_weight * alpha_weight * loss).mean()
+
+        return {'loss_objectness': loss}
+
     def loss_boxes(self, outputs, targets, indices, num_boxes, boxes_weight=None):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
            targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
@@ -132,6 +305,11 @@ class RTDETRCriterionv2(nn.Module):
             'boxes': self.loss_boxes,
             'focal': self.loss_labels_focal,
             'vfl': self.loss_labels_vfl,
+            'objectness': self.loss_objectness,
+            'count_poisson': self.loss_count_poisson,
+            'count_mse': self.loss_count_mse,
+            'count_l1': self.loss_count_l1,
+            'count_smooth_l1': self.loss_count_smooth_l1
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -207,6 +385,9 @@ class RTDETRCriterionv2(nn.Module):
                 matched = self.matcher(aux_outputs, targets)
                 indices = matched['indices']
                 for loss in self.losses:
+                    # Exclude poisson loss for encoder
+                    if loss == 'count_poisson':
+                        continue
                     meta = self.get_loss_meta_info(loss, aux_outputs, enc_targets, indices)
                     l_dict = self.get_loss(loss, aux_outputs, enc_targets, indices, num_boxes, **meta)
                     l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
