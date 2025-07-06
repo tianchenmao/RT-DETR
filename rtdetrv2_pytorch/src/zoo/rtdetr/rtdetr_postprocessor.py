@@ -46,36 +46,35 @@ class RTDETRPostProcessor(nn.Module):
     
     # def forward(self, outputs, orig_target_sizes):
     def forward(self, outputs, orig_target_sizes: torch.Tensor):
-        logits, boxes, counts = outputs['pred_objectness_logits'], outputs['pred_boxes'], outputs['pred_counts']
+        logits, boxes, counts = outputs['pred_logits'], outputs['pred_boxes'], outputs['pred_counts']
+        counts = counts.squeeze(-1) if counts.dim() == 3 else counts  # [B, Q]
         # orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)        
 
         bbox_pred = torchvision.ops.box_convert(boxes, in_fmt='cxcywh', out_fmt='xyxy')
         bbox_pred *= orig_target_sizes.repeat(1, 2).unsqueeze(1)
 
-        # if self.use_focal_loss:
-        #     scores = F.sigmoid(logits)
-        #     scores, index = torch.topk(scores.flatten(1), self.num_top_queries, dim=-1)
-        #     # TODO for older tensorrt
-        #     # labels = index % self.num_classes
-        #     labels = mod(index, self.num_classes)
-        #     index = index // self.num_classes
-        #     boxes = bbox_pred.gather(dim=1, index=index.unsqueeze(-1).repeat(1, 1, bbox_pred.shape[-1]))
-        #
-        # else:
-        #     scores = F.softmax(logits)[:, :, :-1]
-        #     scores, labels = scores.max(dim=-1)
-        #     if scores.shape[1] > self.num_top_queries:
-        #         scores, index = torch.topk(scores, self.num_top_queries, dim=-1)
-        #         labels = torch.gather(labels, dim=1, index=index)
-        #         boxes = torch.gather(boxes, dim=1, index=index.unsqueeze(-1).tile(1, 1, boxes.shape[-1]))
+        if self.use_focal_loss:
+            scores = F.sigmoid(logits)
+            scores, index = torch.topk(scores.flatten(1), self.num_top_queries, dim=-1)
+            # TODO for older tensorrt
+            # labels = index % self.num_classes
+            labels = mod(index, self.num_classes)
+            index = index // self.num_classes
+            boxes = bbox_pred.gather(dim=1, index=index.unsqueeze(-1).repeat(1, 1, bbox_pred.shape[-1]))
+            counts = counts.gather(dim=1, index=index)
 
-        scores = F.sigmoid(logits).squeeze(-1)
-        scores, index = torch.topk(scores, self.num_top_queries, dim=-1)
-        labels = counts.int().squeeze(-1)
-        boxes = bbox_pred.gather(dim=1, index=index.unsqueeze(-1).repeat(1, 1, bbox_pred.shape[-1]))
+        else:
+            scores = F.softmax(logits)[:, :, :-1]
+            scores, labels = scores.max(dim=-1)
+            if scores.shape[1] > self.num_top_queries:
+                scores, index = torch.topk(scores, self.num_top_queries, dim=-1)
+                labels = torch.gather(labels, dim=1, index=index)
+                boxes = torch.gather(boxes, dim=1, index=index.unsqueeze(-1).tile(1, 1, boxes.shape[-1]))
+                counts = counts.gather(dim=1, index=index)
+
         # TODO for onnx export
         if self.deploy_mode:
-            return labels, boxes, scores
+            return labels, boxes, scores, counts
 
         # TODO
         if self.remap_mscoco_category:
@@ -84,8 +83,8 @@ class RTDETRPostProcessor(nn.Module):
                 .to(boxes.device).reshape(labels.shape)
 
         results = []
-        for lab, box, sco in zip(labels, boxes, scores):
-            result = dict(labels=lab, boxes=box, scores=sco)
+        for lab, box, sco, cnt in zip(labels, boxes, scores, counts):
+            result = dict(labels=lab, boxes=box, scores=sco, counts=cnt)
             results.append(result)
         
         return results

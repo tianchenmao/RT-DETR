@@ -16,7 +16,8 @@ def get_contrastive_denoising_training_group(targets,
                                              num_denoising=100,
                                              label_noise_ratio=0.5,
                                              count_noise_scale=2,
-                                             box_noise_scale=1.0,):
+                                             box_noise_scale=1.0,
+                                             bin_size=10,):
     """cnd"""
     if num_denoising <= 0:
         return None, None, None, None
@@ -41,7 +42,9 @@ def get_contrastive_denoising_training_group(targets,
     for i in range(bs):
         num_gt = num_gts[i]
         if num_gt > 0:
-            input_query_class[i, :num_gt] = targets[i]['labels']
+            counts = targets[i]['labels'].to(torch.float32)
+            coarse = ((counts - 1) // bin_size).clamp(0, num_classes - 1).long()
+            input_query_class[i, :num_gt] = coarse
             input_query_count[i, :num_gt] = targets[i]['labels']
             input_query_bbox[i, :num_gt] = targets[i]['boxes']
             pad_gt_mask[i, :num_gt] = 1
@@ -83,7 +86,9 @@ def get_contrastive_denoising_training_group(targets,
         input_query_bbox_unact = inverse_sigmoid(input_query_bbox)
 
     input_query_logits = class_embed(input_query_class)
-    input_query_count_logits = input_query_logits = count_embed(input_query_count.unsqueeze(-1)) # shape [bs, N, 1] → [bs, N, hidden_dim]
+    input_query_count_logits= count_embed(input_query_count.unsqueeze(-1)) # shape [bs, N, 1] → [bs, N, hidden_dim]
+    # TODO 应该把粗类别和精确的count生成的content融合起来吗
+    input_query_logits += input_query_count_logits
 
     tgt_size = num_denoising + num_queries
     attn_mask = torch.full([tgt_size, tgt_size], False, dtype=torch.bool, device=device)
@@ -110,4 +115,4 @@ def get_contrastive_denoising_training_group(targets,
     # print(input_query_bbox.shape) # torch.Size([4, 196, 4])
     # print(attn_mask.shape) # torch.Size([496, 496])
     
-    return input_query_logits, input_query_count_logits, input_query_bbox_unact, attn_mask, dn_meta
+    return input_query_logits, input_query_bbox_unact, attn_mask, dn_meta

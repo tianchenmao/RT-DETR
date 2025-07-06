@@ -7,7 +7,7 @@ ema:
   warmups: 2000
 
 
-epoches: 150
+epoches: 200
 clip_max_norm: 0.1
 
 

@@ -251,16 +251,17 @@ class TransformerDecoder(nn.Module):
                 ref_points_unact,
                 memory,
                 memory_spatial_shapes,
+                class_centers,
                 bbox_head,
                 score_head,
-                objectness_head,
                 count_head,
                 query_pos_head,
                 attn_mask=None,
                 memory_mask=None):
+        # TODO count是一步到位，还是说基于粗类别的基础，计算偏移量，跟bbox一样。以及使用软类别还是硬类别
+        # TODO logits部分计算的center要不要detach，换句话说count损失应不应该训练分类头
         dec_out_bboxes = []
         dec_out_logits = []
-        dec_out_objectness_logits = []
         dec_out_counts = []
         ref_points_detach = F.sigmoid(ref_points_unact)
 
@@ -274,25 +275,39 @@ class TransformerDecoder(nn.Module):
             inter_ref_bbox = F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points_detach))
 
             if self.training:
-                dec_out_logits.append(score_head[i](output))
-                dec_out_objectness_logits.append(objectness_head[i](output))
-                dec_out_counts.append(count_head[i](output))
+                count_logits = score_head[i](output)  # [B, Q, num_bins]
+                dec_out_logits.append(count_logits)
+                count_offset = count_head[i](output)  # [B, Q, 1]
+
+                probs = F.softmax(count_logits, dim=-1)  # [B, Q, C]
+                centers = class_centers.to(output.device).view(1, 1, -1)
+                coarse_center = (probs * centers).sum(dim=-1)  # [B, Q]
+                final_count = coarse_center + count_offset.squeeze(-1)  # [B, Q]
+
+                dec_out_counts.append(final_count)
                 if i == 0:
                     dec_out_bboxes.append(inter_ref_bbox)
                 else:
                     dec_out_bboxes.append(F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points)))
 
             elif i == self.eval_idx:
-                dec_out_logits.append(score_head[i](output))
-                dec_out_objectness_logits.append(objectness_head[i](output))
-                dec_out_counts.append(count_head[i](output))
+                count_logits = score_head[i](output)
+                dec_out_logits.append(count_logits)
+                count_offset = count_head[i](output)
+
+                probs = F.softmax(count_logits, dim=-1)
+                centers = class_centers.to(output.device).view(1, 1, -1)
+                coarse_center = (probs * centers).sum(dim=-1)
+                final_count = coarse_center + count_offset.squeeze(-1)
+
+                dec_out_counts.append(final_count)
                 dec_out_bboxes.append(inter_ref_bbox)
                 break
 
             ref_points = inter_ref_bbox
             ref_points_detach = inter_ref_bbox.detach()
 
-        return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), torch.stack(dec_out_objectness_logits), torch.stack(dec_out_counts)
+        return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), torch.stack(dec_out_counts)
 
 
 @register()
@@ -321,7 +336,9 @@ class RTDETRTransformerv2(nn.Module):
                  eps=1e-2, 
                  aux_loss=True, 
                  cross_attn_method='default', 
-                 query_select_method='default'):
+                 query_select_method='default',
+                 class_centers=torch.tensor([5.5,15.5,25.5,35.5,45.5])):
+        # TODO 把class_centers设置成可学习参数
         super().__init__()
         assert len(feat_channels) <= num_levels
         assert len(feat_strides) == len(feat_channels)
@@ -339,6 +356,7 @@ class RTDETRTransformerv2(nn.Module):
         self.num_layers = num_layers
         self.eval_spatial_size = eval_spatial_size
         self.aux_loss = aux_loss
+        self.class_centers = class_centers
 
         assert query_select_method in ('default', 'one2many', 'agnostic'), ''
         assert cross_attn_method in ('default', 'discrete'), ''
@@ -359,7 +377,7 @@ class RTDETRTransformerv2(nn.Module):
         self.box_noise_scale = box_noise_scale
         if num_denoising > 0: 
             self.denoising_class_embed = nn.Embedding(num_classes+1, hidden_dim, padding_idx=num_classes)
-            # TODO 使用count和area或者w h一起做嵌入
+            # TODO 这里是使用粗类别还是用精确的count？
             self.count_embed = MLP(1,hidden_dim,hidden_dim,1)
 
             init.normal_(self.denoising_class_embed.weight[:-1])
@@ -387,8 +405,6 @@ class RTDETRTransformerv2(nn.Module):
 
         self.enc_count_head = nn.Sequential(MLP(hidden_dim, hidden_dim, 1, 3), nn.Softplus())
 
-        self.enc_objectness_head = MLP(hidden_dim, hidden_dim, 1, 3)
-
         # decoder head
         self.dec_score_head = nn.ModuleList([
             nn.Linear(hidden_dim, num_classes) for _ in range(num_layers)
@@ -400,8 +416,6 @@ class RTDETRTransformerv2(nn.Module):
         self.dec_count_head = nn.ModuleList([nn.Sequential(
             MLP(hidden_dim, hidden_dim, 1, 3),
             nn.Softplus()) for _ in range(num_layers)])
-
-        self.dec_objectness_head = nn.ModuleList([MLP(hidden_dim, hidden_dim, 1, 3) for _ in range(num_layers)])
 
         # init encoder output anchors and valid_mask
         if self.eval_spatial_size:
@@ -502,136 +516,13 @@ class RTDETRTransformerv2(nn.Module):
 
         return anchors, valid_mask
 
-
-    def cluster_based_query_generation(self,features, logits, base_memory, base_boxes, base_logits, spatial_shapes,
-                                       box_deltas, max_queries=300, eps=0.05, min_samples=3, margin=0.01):
-        """
-        Args:
-            features: [B, L, C], encoder memory output
-            logits: [B, L, num_classes], encoder scores
-            base_memory: [B, N, C], original top-k memory features
-            base_boxes: [B, N, 4], original top-k unactivated boxes
-            base_logits: [B, N, 1], original top-k logits
-            spatial_shapes: [num_levels, 2], tensor with (H, W) of each encoder level
-            box_deltas: [B, H*W, 4], encoder bbox head output (i.e., predicted box offsets)
-            max_queries: int, maximum number of query slots (default: 300)
-            eps: float, DBSCAN neighborhood threshold (in normalized [0,1] units)
-            min_samples: int, DBSCAN minimum number of samples to form a cluster
-
-        Returns:
-            merged_feats: [B, N, C], updated query features
-            merged_boxes: [B, N, 4], updated unactivated query boxes
-            merged_logits: [B, N, 1], updated query logits
-        """
-        B, L, C = features.shape
-        N = base_memory.shape[1]
-        merged_feats, merged_coords, merged_scores = [], [], []
-        cluster_box_records = []
-
-        coords_all = []
-        for (Hi, Wi) in spatial_shapes:
-            y, x = torch.meshgrid(
-                torch.linspace(0, 1, Hi),
-                torch.linspace(0, 1, Wi), indexing='ij')
-            coord = torch.stack([y, x], dim=-1).reshape(-1, 2)
-            coords_all.append(coord)
-        coords = torch.cat(coords_all, dim=0).to(features.device)  # [L, 2]
-
-        for b in range(B):
-            cls_scores = logits[b].max(dim=-1).values  # [L]
-            topk = min(1000, L)
-            topk_idx = cls_scores.topk(topk).indices  # [topk]
-
-            points_xy = coords[topk_idx]  # [topk, 2]
-            feats = features[b][topk_idx]  # [topk, C]
-            score_vals = logits[b][topk_idx]  # [topk, 1]
-            box_delta_topk = box_deltas[b][topk_idx]  # [topk, 4]
-
-            with torch.no_grad():
-                pca = PCA(n_components=2)
-                feats_pca = torch.from_numpy(pca.fit_transform(feats.cpu().numpy())).to(feats.device)
-
-            cluster_input = torch.cat([points_xy, feats_pca], dim=-1).cpu().numpy()
-
-            try:
-                cluster = DBSCAN(eps=eps, min_samples=min_samples).fit(cluster_input)
-                labels = cluster.labels_
-            except:
-                labels = -torch.ones(topk, dtype=torch.long)
-
-            num_clusters = max(labels.max() + 1, 0)
-            cluster_feats, cluster_coords, cluster_logits = [], [], []
-
-            for k in range(num_clusters):
-                mask_k = (labels == k)
-                if mask_k.sum() == 0:
-                    continue
-                idx = torch.from_numpy(mask_k).nonzero(as_tuple=False).squeeze(1).to(feats.device)
-                pts = points_xy[idx]  # [N_k, 2]
-                # TODO 对簇内特征进行平均还是取最值
-                feat_k = feats[idx].mean(dim=0)
-                logit_k = score_vals[idx].max(dim=0).values
-
-                cxcy = pts.mean(dim=0)
-                # skip boxes near border
-                if (cxcy < margin).any() or (cxcy > 1-margin).any():
-                    continue
-                wh = pts.max(dim=0).values - pts.min(dim=0).values + 1e-6
-                ref_box = torch.cat([cxcy, wh], dim=-1)  # [4]
-                # inverse-sigmoid
-                ref_box = torch.clamp(torch.logit(ref_box.clamp(1e-4, 1 - 1e-4)), -10, 10)
-                delta_k = box_delta_topk[idx].mean(dim=0)
-                # TODO Does delta work here?
-                # ref_box = ref_box + delta_k
-
-                cluster_feats.append(feat_k)
-                cluster_coords.append(ref_box)
-                cluster_logits.append(logit_k)
-
-            if len(cluster_feats) == 0:
-                cluster_box_records.append({'bboxes': []})
-                merged_feats.append(base_memory[b])
-                merged_coords.append(base_boxes[b])
-                merged_scores.append(base_logits[b])
-                continue
-
-            cluster_feats = torch.stack(cluster_feats, dim=0)
-            cluster_coords = torch.stack(cluster_coords, dim=0)
-            cluster_logits = torch.stack(cluster_logits, dim=0)
-
-            cluster_coords_sigmoid = torch.sigmoid(cluster_coords.detach().cpu())
-            cluster_box_records.append({
-                'bboxes': cluster_coords_sigmoid.tolist()  # normalized cxcywh
-            })
-
-            n_new = cluster_feats.shape[0]
-            n_old = base_memory.shape[1]
-            n_keep = max(n_old - n_new, 0)
-
-            base_scores = base_logits[b].max(dim=-1).values
-            base_order = base_scores.argsort(descending=True)[:n_keep]
-
-            merged_feat = torch.cat([base_memory[b][base_order], cluster_feats], dim=0)
-            merged_box = torch.cat([base_boxes[b][base_order], cluster_coords], dim=0)
-            merged_logit = torch.cat([base_logits[b][base_order], cluster_logits], dim=0)
-
-            if merged_feat.shape[0] < n_old:
-                pad = n_old - merged_feat.shape[0]
-                merged_feat = F.pad(merged_feat, (0, 0, 0, pad))
-                merged_box = F.pad(merged_box, (0, 0, 0, pad))
-                merged_logit = F.pad(merged_logit, (0, 0, 0, pad))
-
-            merged_feats.append(merged_feat)
-            merged_coords.append(merged_box)
-            merged_scores.append(merged_logit)
-
-        return torch.stack(merged_feats),  torch.stack(merged_scores), torch.stack(merged_coords), cluster_box_records # [B, N, C], [B, N, 1], [B, N, 4]
-
     def _get_decoder_input(self,
                            memory: torch.Tensor,
                            spatial_shapes,
                            denoising_logits=None,
                            denoising_bbox_unact=None):
+        # TODO 这里应该引入count_head吗，但如果不引入count_head，enc_aux_outputs就会很麻烦，因为计算时matcher那部分需要用到count，
+        # TODO 目前是把count去掉了
 
         # prepare input for decoder
         if self.training or self.eval_spatial_size is None:
@@ -646,7 +537,7 @@ class RTDETRTransformerv2(nn.Module):
 
         output_memory :torch.Tensor = self.enc_output(memory)
         # TODO 数目越大，topk分数越高是否合理
-        enc_outputs_logits :torch.Tensor = self.enc_objectness_head(output_memory)
+        enc_outputs_logits :torch.Tensor = self.enc_score_head(output_memory)
         box_deltas = self.enc_bbox_head(output_memory)
         enc_outputs_coord_unact :torch.Tensor = box_deltas + anchors
 
@@ -709,7 +600,7 @@ class RTDETRTransformerv2(nn.Module):
         
         # prepare denoising training
         if self.training and self.num_denoising > 0:
-            denoising_logits, denoising_count_logits, denoising_bbox_unact, attn_mask, dn_meta = \
+            denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = \
                 get_contrastive_denoising_training_group(targets, \
                     self.num_classes, 
                     self.num_queries, 
@@ -719,20 +610,20 @@ class RTDETRTransformerv2(nn.Module):
                     label_noise_ratio=self.label_noise_ratio, 
                     box_noise_scale=self.box_noise_scale, )
         else:
-            denoising_logits, denoising_count_logits, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None, None
+            denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None
 
         init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list= \
-            self._get_decoder_input(memory, spatial_shapes, denoising_count_logits, denoising_bbox_unact)
+            self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
-        out_bboxes, out_logits, out_objectness_logits, out_counts = self.decoder(
+        out_bboxes, out_logits, out_counts = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
             spatial_shapes,
+            self.class_centers,
             self.dec_bbox_head,
             self.dec_score_head,
-            self.dec_objectness_head,
             self.dec_count_head,
             self.query_pos_head,
             attn_mask=attn_mask)
@@ -740,18 +631,17 @@ class RTDETRTransformerv2(nn.Module):
         if self.training and dn_meta is not None:
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
             dn_out_logits, out_logits = torch.split(out_logits, dn_meta['dn_num_split'], dim=2)
-            dn_out_objectness_logits, out_objectness_logits = torch.split(out_objectness_logits, dn_meta['dn_num_split'], dim=2)
             dn_out_counts, out_counts = torch.split(out_counts, dn_meta['dn_num_split'], dim=2)
 
-        out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1], 'pred_objectness_logits': out_objectness_logits[-1],'pred_counts': out_counts[-1]}
+        out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1],'pred_counts': out_counts[-1]}
 
         if self.training and self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss_new(out_logits[:-1], out_bboxes[:-1], out_objectness_logits[:-1], out_counts[:-1])
-            out['enc_aux_outputs'] = self._set_aux_loss_new(enc_topk_logits_list, enc_topk_bboxes_list, enc_topk_logits_list, enc_topk_logits_list)
+            out['aux_outputs'] = self._set_aux_loss_new(out_logits[:-1], out_bboxes[:-1], out_counts[:-1])
+            out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
             out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}
 
             if dn_meta is not None:
-                out['dn_aux_outputs'] = self._set_aux_loss_new(dn_out_logits, dn_out_bboxes, dn_out_objectness_logits, dn_out_counts)
+                out['dn_aux_outputs'] = self._set_aux_loss_new(dn_out_logits, dn_out_bboxes, dn_out_counts)
                 out['dn_meta'] = dn_meta
 
         out['cluster_box'] = []
@@ -768,9 +658,9 @@ class RTDETRTransformerv2(nn.Module):
                 for a, b in zip(outputs_class, outputs_coord)]
 
     @torch.jit.unused
-    def _set_aux_loss_new(self, outputs_class, outputs_coord, outputs_objectness, outputs_count):
+    def _set_aux_loss_new(self, outputs_class, outputs_coord, outputs_count):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b, 'pred_objectness_logits': c, 'pred_counts': d}
-                for a, b, c, d in zip(outputs_class, outputs_coord, outputs_objectness, outputs_count)]
+        return [{'pred_logits': a, 'pred_boxes': b, 'pred_counts': c}
+                for a, b, c in zip(outputs_class, outputs_coord, outputs_count)]

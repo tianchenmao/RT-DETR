@@ -118,23 +118,25 @@ def infer_and_plot(model, postprocessor, device, folder, save_dir=None, score_th
         boxes = result['boxes'].cpu()
         scores = result['scores'].cpu()
         labels = result['labels'].cpu()
+        counts = result['counts'].cpu()
 
         keep = nms(boxes, scores, iou_threshold=0.3, score_threshold=score_thresh)
         boxes = boxes[keep]
         scores = scores[keep]
         labels = labels[keep]
+        counts = counts[keep]
 
         if save_dir is not None:
             image.save(os.path.join(save_dir, f'{frame:06d}.jpg'))
 
         fig, ax = plt.subplots(1)
         ax.imshow(image)
-        for box, score, label in zip(boxes, scores, labels):
+        for box, score, label, count in zip(boxes, scores, labels, counts):
             x1, y1, x2, y2 = box.tolist()
             rect = patches.Rectangle((x1, y1), x2 - x1, y2 - y1,
                                      linewidth=2, edgecolor='red', facecolor='none')
             ax.add_patch(rect)
-            ax.text(x1, y1 - 5, f'{label.item()}:{score:.2f}', color='red', fontsize=10)
+            ax.text(x1, y1 - 5, f'{count.item()}:{score:.2f}', color='red', fontsize=10)
         ax.axis('off')
         plt.show()
         time.sleep(0.02)
@@ -166,7 +168,7 @@ if __name__ == '__main__':
     parser.add_argument('-c', '--config', type=str,
                         default=r'C:\Users\fur\PycharmProjects\RT-DETR\rtdetrv2_pytorch\configs\rtdetrv2\rtdetrv2_hgnetv2_x_6x_coco.yml')
     parser.add_argument('-r', '--resume', type=str, help='resume from checkpoint')
-    parser.add_argument('-t', '--tuning', type=str, help='tuning from checkpoint',default=r'E:\rtdetrv2_hgnetv2_x_6x_coco_1\checkpoint0030.pth')
+    parser.add_argument('-t', '--tuning', type=str, help='tuning from checkpoint',default=r'F:\rtdetrv2_hgnetv2_x_6x_coco_1\checkpoint0140.pth')
     parser.add_argument('-d', '--device', type=str, help='device', )
     parser.add_argument('--seed', type=int, help='exp reproducibility')
     parser.add_argument('--use-amp', action='store_true', help='auto mixed precision training')

@@ -30,7 +30,8 @@ class RTDETRCriterionv2(nn.Module):
         losses, 
         alpha=0.2, 
         gamma=2.0, 
-        num_classes=80, 
+        num_classes=80,
+        bin_size=10,
         boxes_weight_format=None,
         share_matched_indices=False):
         """Create the criterion.
@@ -46,7 +47,8 @@ class RTDETRCriterionv2(nn.Module):
         self.num_classes = num_classes
         self.matcher = matcher
         self.weight_dict = weight_dict
-        self.losses = losses 
+        self.losses = losses
+        self.bin_size = bin_size
         self.boxes_weight_format = boxes_weight_format
         self.share_matched_indices = share_matched_indices
         self.alpha = alpha
@@ -64,6 +66,20 @@ class RTDETRCriterionv2(nn.Module):
         loss = torchvision.ops.sigmoid_focal_loss(src_logits, target, self.alpha, self.gamma, reduction='none')
         loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
 
+        return {'loss_focal': loss}
+
+    def loss_coarse_labels_focal(self, outputs, targets, indices, num_boxes):
+        assert 'pred_logits' in outputs
+        src_logits = outputs['pred_logits']
+        idx = self._get_src_permutation_idx(indices)
+        target_counts = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])  # shape [N]
+        target_coarse_classes = ((target_counts - 1) // self.bin_size).clamp(min=0, max=self.num_classes - 1)
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
+                                    dtype=torch.int64, device=src_logits.device)
+        target_classes[idx] = target_coarse_classes
+        target = F.one_hot(target_classes, num_classes=self.num_classes+1)[..., :-1]
+        loss = torchvision.ops.sigmoid_focal_loss(src_logits, target, self.alpha, self.gamma, reduction='none')
+        loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
         return {'loss_focal': loss}
 
     def loss_labels_vfl(self, outputs, targets, indices, num_boxes, values=None):
@@ -91,6 +107,41 @@ class RTDETRCriterionv2(nn.Module):
         pred_score = F.sigmoid(src_logits).detach()
         weight = self.alpha * pred_score.pow(self.gamma) * (1 - target) + target_score
         
+        loss = F.binary_cross_entropy_with_logits(src_logits, target_score, weight=weight, reduction='none')
+        loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
+        return {'loss_vfl': loss}
+
+    def loss_coarse_labels_vfl(self, outputs, targets, indices, num_boxes, values=None):
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices)
+        if values is None:
+            src_boxes = outputs['pred_boxes'][idx]
+            target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+            ious, _ = box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
+            ious = torch.diag(ious).detach()
+        else:
+            ious = values
+
+        src_logits = outputs['pred_logits']
+
+        target_counts = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])  # shape [N]
+
+        # === 将精确 count 映射为 coarse class index ===
+        target_coarse_classes = ((target_counts - 1) // self.bin_size).clamp(min=0, max=self.num_classes - 1)  # shape [N]
+
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes,  # 背景类填充
+                                    dtype=torch.int64, device=src_logits.device)
+        target_classes[idx] = target_coarse_classes
+
+        target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
+
+        target_score_o = torch.zeros_like(target_classes, dtype=src_logits.dtype)
+        target_score_o[idx] = ious.to(target_score_o.dtype)
+        target_score = target_score_o.unsqueeze(-1) * target
+
+        pred_score = F.sigmoid(src_logits).detach()
+        weight = self.alpha * pred_score.pow(self.gamma) * (1 - target) + target_score
+
         loss = F.binary_cross_entropy_with_logits(src_logits, target_score, weight=weight, reduction='none')
         loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
         return {'loss_vfl': loss}
@@ -143,131 +194,6 @@ class RTDETRCriterionv2(nn.Module):
         loss = F.poisson_nll_loss(src_counts, target_counts, log_input=False, full=True, reduction='mean')
         return {'loss_count_poisson': loss}
 
-    def loss_objectness_focal(self, outputs, targets, indices, num_boxes):
-        """
-        Binary Focal Loss for objectness prediction
-        """
-        assert 'pred_objectness_logits' in outputs
-        B, Q = outputs['pred_objectness_logits'].shape[:2]
-        pred_logits = outputs['pred_objectness_logits'].squeeze(-1)  # [B, Q]
-
-        # 构造二值目标：1 为正样本（被 matcher 匹配），其余为 0
-        target = torch.zeros((B, Q), dtype=pred_logits.dtype, device=pred_logits.device)
-        batch_idx, query_idx = self._get_src_permutation_idx(indices)
-        target[batch_idx, query_idx] = 1.0  # positive samples
-
-        # Sigmoid 激活
-        prob = torch.sigmoid(pred_logits)
-        pt = prob * target + (1 - prob) * (1 - target)  # pt = p if t==1 else 1-p
-
-        # Focal loss 权重项
-        focal_weight = (1 - pt) ** self.gamma
-
-        # Alpha 权重
-        alpha_weight = self.alpha * target + (1 - self.alpha) * (1 - target)
-
-        # Focal Loss
-        loss = F.binary_cross_entropy_with_logits(pred_logits, target, reduction='none')
-        loss = (focal_weight * alpha_weight * loss).mean()
-
-        return {'loss_objectness': loss}
-
-    def loss_objectness(self, outputs, targets, indices, num_boxes):
-        """
-        IoU-aware Binary Focal Loss for objectness prediction
-        """
-        assert 'pred_objectness_logits' in outputs
-        B, Q = outputs['pred_objectness_logits'].shape[:2]
-        pred_logits = outputs['pred_objectness_logits'].squeeze(-1)  # [B, Q]
-
-        # 构造 soft target（默认值 0）
-        target = torch.zeros((B, Q), dtype=pred_logits.dtype, device=pred_logits.device)
-
-        # 获取匹配的 (batch_idx, query_idx) 对应的 IoU，作为 soft objectness label
-        batch_idx, query_idx = self._get_src_permutation_idx(indices)
-
-        # 获取预测框和 GT 框
-        pred_boxes = outputs['pred_boxes'][batch_idx, query_idx]  # [N, 4]
-        tgt_boxes = torch.cat([t['boxes'][j] for t, (_, j) in zip(targets, indices)], dim=0)
-
-        # 计算匹配框对之间的 IoU
-        ious,_ = box_iou(box_cxcywh_to_xyxy(pred_boxes), box_cxcywh_to_xyxy(tgt_boxes))
-        iou_diag = ious.diag().clamp(min=0.0, max=1.0).detach()  # [N]
-
-        # 赋予 soft target
-        target[batch_idx, query_idx] = iou_diag  # soft supervision ∈ [0, 1]
-
-        # Sigmoid 激活
-        prob = torch.sigmoid(pred_logits)
-        pt = prob * target + (1 - prob) * (1 - target)  # pt = p if t==1 else 1-p
-
-        # Focal loss 权重项
-        focal_weight = (1 - pt) ** self.gamma
-
-        # Alpha 权重项
-        alpha_weight = self.alpha * target + (1 - self.alpha) * (1 - target)
-
-        # Binary focal loss
-        loss = F.binary_cross_entropy_with_logits(pred_logits, target, reduction='none')
-        loss = (focal_weight * alpha_weight * loss).mean()
-
-        return {'loss_objectness': loss}
-
-    def loss_objectness_vfl_count(self, outputs, targets, indices, num_boxes):
-        """
-        IoU-aware + Count-aware Binary Focal Loss for objectness prediction
-        (using predicted group count vs ground truth count similarity as weight)
-        """
-        assert 'pred_objectness_logits' in outputs
-        assert 'pred_counts' in outputs
-
-        B, Q = outputs['pred_objectness_logits'].shape[:2]
-        pred_logits = outputs['pred_objectness_logits'].squeeze(-1)  # [B, Q]
-
-        # 构造 soft target（默认值 0）
-        target = torch.zeros((B, Q), dtype=pred_logits.dtype, device=pred_logits.device)
-
-        # 获取匹配的 (batch_idx, query_idx)
-        batch_idx, query_idx = self._get_src_permutation_idx(indices)
-
-        # 匹配的预测框和 GT 框
-        pred_boxes = outputs['pred_boxes'][batch_idx, query_idx]
-        tgt_boxes = torch.cat([t['boxes'][j] for t, (_, j) in zip(targets, indices)], dim=0)
-
-        # 计算 IoU 作为 soft objectness label
-        ious, _ = box_iou(box_cxcywh_to_xyxy(pred_boxes), box_cxcywh_to_xyxy(tgt_boxes))
-        iou_diag = ious.diag().clamp(min=0.0, max=1.0).detach()  # [N]
-
-        # =========  Count-aware soft weight =========
-        # 获取每个 sample 的预测 count（直接从 pred_counts 平均或 sum）
-        pred_count_map = outputs['pred_counts'].squeeze(-1)  # [B, Q]
-        pred_counts = pred_count_map.mean(dim=1).clamp(min=1.0)  # [B]
-
-        # GT count: 每个样本中 GT box 数量
-        gt_counts = torch.tensor([len(t['labels']) for t in targets],
-                                 dtype=pred_counts.dtype,
-                                 device=pred_counts.device).clamp(min=1.0)  # [B]
-
-        # count similarity ∈ [0, 1]
-        count_sim = torch.minimum(pred_counts, gt_counts) / torch.maximum(pred_counts, gt_counts)  # [B]
-        count_sim_per_sample = count_sim[batch_idx]  # [N]
-
-        # 构造 soft supervision label: soft = iou × count_sim
-        soft_label = iou_diag * count_sim_per_sample
-        target[batch_idx, query_idx] = soft_label
-
-        # ========= Binary Focal Loss =========
-        prob = torch.sigmoid(pred_logits)
-        pt = prob * target + (1 - prob) * (1 - target)
-
-        focal_weight = (1 - pt) ** self.gamma
-        alpha_weight = self.alpha * target + (1 - self.alpha) * (1 - target)
-
-        loss = F.binary_cross_entropy_with_logits(pred_logits, target, reduction='none')
-        loss = (focal_weight * alpha_weight * loss).mean()
-
-        return {'loss_objectness': loss}
-
     def loss_boxes(self, outputs, targets, indices, num_boxes, boxes_weight=None):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
            targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
@@ -303,9 +229,8 @@ class RTDETRCriterionv2(nn.Module):
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
             'boxes': self.loss_boxes,
-            'focal': self.loss_labels_focal,
-            'vfl': self.loss_labels_vfl,
-            'objectness': self.loss_objectness,
+            'focal': self.loss_coarse_labels_focal,
+            'vfl': self.loss_coarse_labels_vfl,
             'count_poisson': self.loss_count_poisson,
             'count_mse': self.loss_count_mse,
             'count_l1': self.loss_count_l1,
@@ -386,7 +311,7 @@ class RTDETRCriterionv2(nn.Module):
                 indices = matched['indices']
                 for loss in self.losses:
                     # Exclude poisson loss for encoder
-                    if loss == 'count_poisson':
+                    if 'count' in loss:
                         continue
                     meta = self.get_loss_meta_info(loss, aux_outputs, enc_targets, indices)
                     l_dict = self.get_loss(loss, aux_outputs, enc_targets, indices, num_boxes, **meta)
