@@ -11,6 +11,8 @@ from torchvision.ops import box_convert
 import sys
 import time
 import torchvision.ops as ops
+import cv2
+import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 import argparse
@@ -20,7 +22,7 @@ from src.core import YAMLConfig, yaml_utils
 
 
 
-def nms(boxes, scores, iou_threshold=0.5, score_threshold=0.0):
+def nms(boxes, scores, iou_threshold=0.3, score_threshold=0.0):
     """
     Args:
         boxes (Tensor): shape [N, 4], in xyxy format
@@ -98,20 +100,22 @@ def load_images_from_folder(folder_path):
     images.sort()
     return images
 
-def infer_and_plot(model, postprocessor, device, folder, save_dir=None, score_thresh=0.30):
+def infer_and_plot(model, postprocessor, device, folder, sc, save_dir=None, score_thresh=0.40):
     model.eval()
     images = load_images_from_folder(folder)
 
-    for frame, img_path in images:
+    video_writer = None
+    output_video_path = os.path.join(save_dir, f'detect_sc{sc}.mp4') if save_dir else None
+
+    for frame_idx, (frame, img_path) in enumerate(images):
         image = Image.open(img_path).convert('RGB')
-        # transform_resize_with_padding = ResizeWithPadding(target_size=640)
-        # img_tensor, valid_size = transform_resize_with_padding(image)
         img_tensor = transform(image)
         valid_size = torch.tensor([640, 480], dtype=torch.float32).to(device)
         img_tensor = img_tensor.unsqueeze(0).to(device)
+
         with torch.no_grad():
             outputs = model(img_tensor)
-            orig_size = valid_size.to(device)  # shape: [1, 2]
+            orig_size = valid_size.to(device)
             results = postprocessor(outputs, orig_size)
 
         result = results[0]
@@ -126,9 +130,7 @@ def infer_and_plot(model, postprocessor, device, folder, save_dir=None, score_th
         labels = labels[keep]
         counts = counts[keep]
 
-        if save_dir is not None:
-            image.save(os.path.join(save_dir, f'{frame:06d}.jpg'))
-
+        # 可视化
         fig, ax = plt.subplots(1)
         ax.imshow(image)
         for box, score, label, count in zip(boxes, scores, labels, counts):
@@ -136,10 +138,36 @@ def infer_and_plot(model, postprocessor, device, folder, save_dir=None, score_th
             rect = patches.Rectangle((x1, y1), x2 - x1, y2 - y1,
                                      linewidth=2, edgecolor='red', facecolor='none')
             ax.add_patch(rect)
-            ax.text(x1, y1 - 5, f'{count.item()}:{score:.2f}', color='red', fontsize=10)
+            ax.text(x1, y1 - 5, f'{int(count.item())}:{score:.2f}', color='red', fontsize=10)
         ax.axis('off')
+        fig.canvas.draw()
+        # 将 matplotlib 图像转为 numpy array
+        frame_img = np.frombuffer(fig.canvas.tostring_argb(), dtype=np.uint8)
+        frame_img = frame_img.reshape(fig.canvas.get_width_height()[::-1] + (4,))[:, :, 1:]
+        plt.close(fig)
+
+        # 初始化 VideoWriter
+        if video_writer is None and output_video_path:
+            height, width = frame_img.shape[:2]
+            video_writer = cv2.VideoWriter(output_video_path,
+                                           cv2.VideoWriter_fourcc(*'mp4v'),
+                                           30,  # FPS
+                                           (width, height))
+
+        # 写入视频帧
+        if video_writer:
+            frame_bgr = cv2.cvtColor(frame_img, cv2.COLOR_RGB2BGR)
+            video_writer.write(frame_bgr)
+
+        # 可选：显示图像
+        plt.imshow(frame_img)
+        plt.axis('off')
         plt.show()
-        time.sleep(0.02)
+        time.sleep(0.01)
+
+    if video_writer:
+        video_writer.release()
+        print(f"[✅] 视频已保存到: {output_video_path}")
 
 
 def main(args, ) -> None:
@@ -157,8 +185,7 @@ def main(args, ) -> None:
     solver = DetSolver(cfg)
     solver.eval()
 
-    infer_and_plot(solver.model, solver.postprocessor, solver.device, args.test_dir)
-
+    infer_and_plot(solver.model, solver.postprocessor, solver.device, args.test_dir, args.test_sc, args.video_dir)
 
 
 if __name__ == '__main__':
@@ -168,13 +195,16 @@ if __name__ == '__main__':
     parser.add_argument('-c', '--config', type=str,
                         default=r'C:\Users\fur\PycharmProjects\RT-DETR\rtdetrv2_pytorch\configs\rtdetrv2\rtdetrv2_hgnetv2_x_6x_coco.yml')
     parser.add_argument('-r', '--resume', type=str, help='resume from checkpoint')
-    parser.add_argument('-t', '--tuning', type=str, help='tuning from checkpoint',default=r'F:\rtdetrv2_hgnetv2_x_6x_coco_1\checkpoint0140.pth')
+    parser.add_argument('-t', '--tuning', type=str, help='tuning from checkpoint',default=r'F:\rtdetrv2_hgnetv2_x_6x_coco_2\best.pth')
     parser.add_argument('-d', '--device', type=str, help='device', )
     parser.add_argument('--seed', type=int, help='exp reproducibility')
     parser.add_argument('--use-amp', action='store_true', help='auto mixed precision training')
     parser.add_argument('--output-dir', type=str, help='output directoy')
     parser.add_argument('--summary-dir', type=str, help='tensorboard summry')
+    parser.add_argument('--test-sc', type=int, help='test scenario', default=1)
     parser.add_argument('--test-dir', type=str, help='test image directory', default=r'C:\Users\fur\PycharmProjects\UAVGroupTrackingYolo\dataset\test\fullsize\sc1\images')
+    parser.add_argument('--video-dir', type=str, help='detect video directory',
+                        default=r'C:\Users\fur\PycharmProjects\RT-DETR\rtdetrv2_pytorch\tools\output\videos')
     parser.add_argument('--test-only', action='store_true', default=False, )
 
     # priority 1
